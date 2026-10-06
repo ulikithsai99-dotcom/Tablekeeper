@@ -271,6 +271,21 @@ def _fixture_state(fixture: Any) -> ServiceState:
                 seen_managers.add(m)
                 manager_user_ids.append(m)
 
+        combinable_pairs = []
+        if "combinable" in item:
+            raw_comb = item["combinable"]
+            if not isinstance(raw_comb, list):
+                raise _error(400, "malformed_request", "combinable must be an array")
+            for pair in raw_comb:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    raise _invalid("each combinable pair must have 2 table ids")
+                p1, p2 = pair[0], pair[1]
+                if not isinstance(p1, str) or not isinstance(p2, str) or p1 == p2:
+                    raise _invalid("invalid combinable pair")
+                if p1 not in seen_table_ids or p2 not in seen_table_ids:
+                    raise _invalid("combinable table not found")
+                combinable_pairs.append([p1, p2])
+
         state.restaurants[restaurant_id] = {
             "id": restaurant_id,
             "name": name,
@@ -281,6 +296,9 @@ def _fixture_state(fixture: Any) -> ServiceState:
             "opening_hours": normalized_hours,
             "tables": normalized_tables,
             "manager_user_ids": manager_user_ids,
+            "combinable": combinable_pairs,
+            "closures": [],
+            "revision": 0,
             "policies": [],
         }
 
@@ -290,7 +308,8 @@ def _fixture_state(fixture: Any) -> ServiceState:
     for item in reservations_data:
         if not isinstance(item, dict):
             raise _error(400, "malformed_request", "each reservation must be an object")
-        if not all(name in item for name in ("restaurant_id", "table_id", "starts_at_local", "party_size")):
+        has_table = ("table_id" in item) or ("table_ids" in item)
+        if not (has_table and all(name in item for name in ("restaurant_id", "starts_at_local", "party_size"))):
             raise _invalid("seeded reservation is missing required fields")
         reservation_id = _fixture_id(item.get("id", MISSING), "reservation id")
         reference = item.get("reference", MISSING)
@@ -308,15 +327,19 @@ def _fixture_state(fixture: Any) -> ServiceState:
         if reservation_id in seen_reservation_ids or reference in seen_references:
             raise _invalid("duplicate reservation id or reference")
         try:
+            res_payload = {
+                "restaurant_id": item.get("restaurant_id"),
+                "starts_at_local": item.get("starts_at_local"),
+                "party_size": item.get("party_size"),
+            }
+            if "table_id" in item:
+                res_payload["table_id"] = item.get("table_id")
+            if "table_ids" in item:
+                res_payload["table_ids"] = item.get("table_ids")
             record = _new_reservation(
                 state,
                 user_id,
-                {
-                    "restaurant_id": item.get("restaurant_id"),
-                    "table_id": item.get("table_id"),
-                    "starts_at_local": item.get("starts_at_local"),
-                    "party_size": item.get("party_size"),
-                },
+                res_payload,
                 reservation_id=reservation_id,
                 reference=reference,
                 created_at=now,
@@ -541,20 +564,69 @@ def _record_end(record: dict[str, Any]) -> datetime:
     return _aware(record["ends_at"])
 
 
+def _normalize_table_selection(restaurant: dict[str, Any], values: dict[str, Any]) -> list[str]:
+    if "table_id" in values and "table_ids" in values:
+        raise _error(422, "validation_failed", "cannot provide both table_id and table_ids")
+    if "table_id" in values:
+        tid = _required_id(values, "table_id")
+        if not any(t["id"] == tid for t in restaurant["tables"]):
+            raise _not_found()
+        return [tid]
+    if "table_ids" in values:
+        tids = values["table_ids"]
+        if not isinstance(tids, list) or not tids:
+            raise _error(422, "validation_failed", "table_ids must be a non-empty array")
+        for tid in tids:
+            if not isinstance(tid, str) or not (1 <= len(tid) <= 64):
+                raise _error(422, "validation_failed", "each table_id must be 1 to 64 characters")
+        if len(tids) != len(set(tids)):
+            raise _error(422, "validation_failed", "duplicate table ID in table_ids")
+        for tid in tids:
+            if not any(t["id"] == tid for t in restaurant["tables"]):
+                raise _not_found()
+        if len(tids) > 2:
+            raise _error(422, "combination_not_allowed", "combinations are pairs only")
+        if len(tids) == 2:
+            pair_set = set(tids)
+            allowed = [set(p) for p in restaurant.get("combinable", [])]
+            if pair_set not in allowed:
+                raise _error(422, "combination_not_allowed", "table combination not allowed")
+        return list(tids)
+    raise _error(422, "validation_failed", "table_id or table_ids is required")
+
+
+def _table_selection_capacity(restaurant: dict[str, Any], policy: dict[str, Any], table_ids: list[str]) -> int:
+    table_cap_map = {t["id"]: t["capacity"] for t in restaurant["tables"]}
+    caps = policy.get("capacities", {})
+    return sum(caps.get(tid, table_cap_map.get(tid, 0)) for tid in table_ids)
+
+
 def _has_conflict(
     state: ServiceState,
     restaurant_id: str,
-    table_id: str,
+    table_or_tables: str | list[str],
     start: datetime,
     end: datetime,
     *,
     ignore_references: set[str] | None = None,
 ) -> bool:
+    target_tables = set([table_or_tables] if isinstance(table_or_tables, str) else table_or_tables)
     ignored = ignore_references or set()
+    restaurant = state.restaurants.get(restaurant_id)
+    if restaurant is not None:
+        for cl in restaurant.get("closures", []):
+            if cl["table_id"] in target_tables:
+                c_start = _aware(cl["from"])
+                c_end = _aware(cl["to"])
+                if _overlap(start, end, c_start, c_end):
+                    return True
     for reference, existing in state.reservations.items():
         if reference in ignored or existing.get("status") != "confirmed":
             continue
-        if existing["restaurant_id"] != restaurant_id or existing["table_id"] != table_id:
+        if existing["restaurant_id"] != restaurant_id:
+            continue
+        existing_tables = set(existing.get("table_ids") or ([existing["table_id"]] if "table_id" in existing else []))
+        if not (target_tables & existing_tables):
             continue
         if _overlap(start, end, _aware(existing["starts_at"]), _record_end(existing)):
             return True
@@ -563,11 +635,22 @@ def _has_conflict(
 
 def _serialize_reservation(record: dict[str, Any]) -> dict[str, Any]:
     fields = [
-        "reservation_id", "reference", "restaurant_id", "table_id",
+        "reservation_id", "reference", "restaurant_id", "table_id", "table_ids",
         "party_size", "status", "starts_at_local", "starts_at", "ends_at",
         "created_at", "revision", "accepted_terms"
     ]
-    return {k: copy.deepcopy(record[k]) for k in fields if k in record}
+    res = {}
+    for k in fields:
+        if k in record:
+            res[k] = copy.deepcopy(record[k])
+    if "table_ids" not in res and "table_id" in res:
+        res["table_ids"] = [res["table_id"]]
+    if "table_ids" in res:
+        if len(res["table_ids"]) == 1:
+            res["table_id"] = res["table_ids"][0]
+        else:
+            res.pop("table_id", None)
+    return res
 
 
 def _new_reservation(
@@ -582,14 +665,16 @@ def _new_reservation(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     restaurant_id = _required_id(values, "restaurant_id")
-    table_id = _required_id(values, "table_id")
+    restaurant = state.restaurants.get(restaurant_id)
+    if restaurant is None:
+        raise _not_found()
+    table_ids = _normalize_table_selection(restaurant, values)
     party_size = _party_size(values)
     if "starts_at_local" not in values:
         raise _invalid("starts_at_local is required")
-    restaurant, table = _restaurant_table(state, restaurant_id, table_id)
     naive = _parse_local(values["starts_at_local"])
     effective_policy = policy or get_effective_policy(restaurant, naive.date())
-    capacity = effective_policy["capacities"].get(table_id, table["capacity"])
+    capacity = _table_selection_capacity(restaurant, effective_policy, table_ids)
     if party_size > capacity:
         raise _error(422, "party_exceeds_capacity", "party size exceeds table capacity")
     start, local_string = _resolve_booking_time(restaurant, values.get("starts_at_local"), policy=effective_policy)
@@ -598,7 +683,7 @@ def _new_reservation(
     if _has_conflict(
         state,
         restaurant_id,
-        table_id,
+        table_ids,
         start,
         end,
         ignore_references=ignore_references,
@@ -613,24 +698,28 @@ def _new_reservation(
     assert reference is not None
     now_ts = created_at or rfc3339(datetime.now(UTC))
     terms = extract_accepted_terms(effective_policy)
+    changes = []
+    if len(table_ids) > 1:
+        changes.append({"field": "table_ids", "from": None, "to": list(table_ids)})
+    else:
+        changes.append({"field": "table_id", "from": None, "to": table_ids[0]})
+    changes.append({"field": "starts_at_local", "from": None, "to": local_string})
+    changes.append({"field": "party_size", "from": None, "to": party_size})
+
     history_entry = {
         "seq": 1,
         "at": now_ts,
         "event": "created",
         "revision": 1,
         "accepted_terms": copy.deepcopy(terms),
-        "changes": [
-            {"field": "table_id", "from": None, "to": table_id},
-            {"field": "starts_at_local", "from": None, "to": local_string},
-            {"field": "party_size", "from": None, "to": party_size},
-        ],
+        "changes": changes,
     }
     record = {
         "reservation_id": reservation_id or uuid.uuid4().hex,
         "reference": reference,
         "user_id": user_id,
         "restaurant_id": restaurant_id,
-        "table_id": table_id,
+        "table_ids": list(table_ids),
         "party_size": party_size,
         "status": "confirmed",
         "starts_at_local": local_string,
@@ -641,7 +730,198 @@ def _new_reservation(
         "accepted_terms": terms,
         "history": [history_entry],
     }
+    if len(table_ids) == 1:
+        record["table_id"] = table_ids[0]
     return record
+
+
+def _compute_replan(
+    restaurant: dict[str, Any],
+    closure_table_id: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    from_str: str,
+    to_str: str,
+    state: ServiceState,
+) -> dict[str, Any]:
+    restaurant_id = restaurant["id"]
+    tables = restaurant["tables"]
+    combinable = restaurant.get("combinable", [])
+
+    singles = [[t["id"]] for t in tables]
+    pairs = [list(p) for p in combinable]
+    all_options = singles + pairs
+
+    if len(tables) > 6 or len(pairs) > 4:
+        raise DomainError(422, "planning_limit", "planning limit exceeded")
+
+    considered: list[dict[str, Any]] = []
+    for r in state.reservations.values():
+        if r.get("restaurant_id") == restaurant_id and r.get("status") == "confirmed":
+            b_start = _aware(r["starts_at"])
+            b_end = _record_end(r)
+            if _overlap(b_start, b_end, from_dt, to_dt):
+                considered.append(r)
+
+    if len(considered) > 6:
+        raise DomainError(422, "planning_limit", "planning limit exceeded")
+
+    considered.sort(key=lambda b: b["reference"])
+    K = len(considered)
+    plan_id = "plan_" + secrets.token_hex(16)
+
+    if K == 0:
+        return {
+            "plan_id": plan_id,
+            "restaurant_id": restaurant_id,
+            "restaurant_revision": restaurant.get("revision", 0),
+            "closure": {
+                "table_id": closure_table_id,
+                "from": from_str,
+                "to": to_str,
+            },
+            "assignments": [],
+            "moved_count": 0,
+            "unused_seats": 0,
+            "applied": False,
+        }
+
+    considered_refs = {b["reference"] for b in considered}
+    fixed: list[dict[str, Any]] = [
+        r for r in state.reservations.values()
+        if r.get("restaurant_id") == restaurant_id and r.get("status") == "confirmed" and r["reference"] not in considered_refs
+    ]
+    applied_closures = restaurant.get("closures", [])
+    table_cap_map = {t["id"]: t["capacity"] for t in tables}
+
+    eligible_per_booking: list[list[tuple[int, list[str], bool, int]]] = []
+    for b in considered:
+        b_start = _aware(b["starts_at"])
+        b_end = _record_end(b)
+        b_party = b["party_size"]
+        curr_tables = set(b.get("table_ids") or ([b["table_id"]] if "table_id" in b else []))
+        terms = b.get("accepted_terms", {})
+        term_caps = terms.get("capacities", {})
+
+        booking_opts = []
+        for opt_idx, opt in enumerate(all_options):
+            cap = sum(term_caps.get(tid, table_cap_map.get(tid, 0)) for tid in opt)
+            if cap < b_party:
+                continue
+
+            if closure_table_id in opt and _overlap(b_start, b_end, from_dt, to_dt):
+                continue
+
+            conflict_applied = False
+            for cl in applied_closures:
+                if cl["table_id"] in opt:
+                    cl_start = _aware(cl["from"])
+                    cl_end = _aware(cl["to"])
+                    if _overlap(b_start, b_end, cl_start, cl_end):
+                        conflict_applied = True
+                        break
+            if conflict_applied:
+                continue
+
+            conflict_fixed = False
+            opt_set = set(opt)
+            for f in fixed:
+                f_tables = set(f.get("table_ids") or ([f["table_id"]] if "table_id" in f else []))
+                if (opt_set & f_tables) and _overlap(b_start, b_end, _aware(f["starts_at"]), _record_end(f)):
+                    conflict_fixed = True
+                    break
+            if conflict_fixed:
+                continue
+
+            changed = (set(opt) != curr_tables)
+            unused = cap - b_party
+            booking_opts.append((opt_idx, opt, changed, unused))
+
+        if not booking_opts:
+            raise DomainError(409, "no_feasible_plan", "no feasible plan")
+        eligible_per_booking.append(booking_opts)
+
+    best_cost: tuple[int, int, tuple[int, ...]] | None = None
+    best_assignment: list[tuple[int, list[str], bool]] | None = None
+
+    current_assignment: list[tuple[int, list[str], bool] | None] = [None] * K
+    current_tables_assigned: list[set[str] | None] = [None] * K
+
+    def backtrack(idx: int, cur_moved: int, cur_unused: int, cur_ranks: list[int]):
+        nonlocal best_cost, best_assignment
+        if idx == K:
+            cost = (cur_moved, cur_unused, tuple(cur_ranks))
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_assignment = list(current_assignment)  # type: ignore
+            return
+
+        b = considered[idx]
+        b_start = _aware(b["starts_at"])
+        b_end = _record_end(b)
+
+        for opt_idx, opt, changed, unused in eligible_per_booking[idx]:
+            opt_set = set(opt)
+            conflict = False
+            for prev_idx in range(idx):
+                if opt_set & current_tables_assigned[prev_idx]:  # type: ignore
+                    prev_b = considered[prev_idx]
+                    if _overlap(b_start, b_end, _aware(prev_b["starts_at"]), _record_end(prev_b)):
+                        conflict = True
+                        break
+            if conflict:
+                continue
+
+            new_moved = cur_moved + (1 if changed else 0)
+            new_unused = cur_unused + unused
+            new_ranks = cur_ranks + [opt_idx]
+
+            if best_cost is not None:
+                if new_moved > best_cost[0]:
+                    continue
+                if new_moved == best_cost[0] and new_unused > best_cost[1]:
+                    continue
+                if (
+                    new_moved == best_cost[0]
+                    and new_unused == best_cost[1]
+                    and tuple(new_ranks) > best_cost[2][: len(new_ranks)]
+                ):
+                    continue
+
+            current_assignment[idx] = (opt_idx, opt, changed)
+            current_tables_assigned[idx] = opt_set
+            backtrack(idx + 1, new_moved, new_unused, new_ranks)
+            current_tables_assigned[idx] = None
+            current_assignment[idx] = None
+
+    backtrack(0, 0, 0, [])
+
+    if best_assignment is None:
+        raise DomainError(409, "no_feasible_plan", "no feasible plan")
+
+    assignments = []
+    for idx, b in enumerate(considered):
+        opt_idx, opt, changed = best_assignment[idx]
+        assignments.append({
+            "reference": b["reference"],
+            "table_ids": list(opt),
+            "changed": bool(changed),
+        })
+
+    return {
+        "plan_id": plan_id,
+        "restaurant_id": restaurant_id,
+        "restaurant_revision": restaurant.get("revision", 0),
+        "closure": {
+            "table_id": closure_table_id,
+            "from": from_str,
+            "to": to_str,
+        },
+        "assignments": assignments,
+        "moved_count": best_cost[0],
+        "unused_seats": best_cost[1],
+        "applied": False,
+    }
 
 
 def _validate_idempotency_key(headers: dict[str, str]) -> str:
@@ -768,6 +1048,9 @@ def _default_seed_state() -> ServiceState:
             "opening_hours": default_hours,
             "tables": make_tables(6),
             "manager_user_ids": ["u_ada"],
+            "combinable": [],
+            "closures": [],
+            "revision": 0,
             "policies": [],
         }
 
@@ -906,6 +1189,31 @@ class TablekeeperService:
                 return await self._publish_policy(restaurant_id, user_id, payload, key, path)
             raise _not_found()
 
+        replans_apply_match = re.fullmatch(r"/restaurants/([^/]+)/replans/([^/]+)/apply", path)
+        if replans_apply_match:
+            restaurant_id = unquote(replans_apply_match.group(1))
+            plan_id = unquote(replans_apply_match.group(2))
+            if not restaurant_id or len(restaurant_id) > 64:
+                raise _invalid("restaurant id must contain 1 to 64 characters")
+            if method == "POST":
+                payload = _require_object(body)
+                user_id = await self._authenticated_user(headers)
+                key = _validate_idempotency_key(headers)
+                return await self._apply_replan(restaurant_id, plan_id, user_id, payload, key, path)
+            raise _not_found()
+
+        replans_match = re.fullmatch(r"/restaurants/([^/]+)/replans", path)
+        if replans_match:
+            restaurant_id = unquote(replans_match.group(1))
+            if not restaurant_id or len(restaurant_id) > 64:
+                raise _invalid("restaurant id must contain 1 to 64 characters")
+            if method == "POST":
+                payload = _require_object(body)
+                user_id = await self._authenticated_user(headers)
+                key = _validate_idempotency_key(headers)
+                return await self._create_replan(restaurant_id, user_id, payload, key, path)
+            raise _not_found()
+
         restaurant_match = re.fullmatch(r"/restaurants/([^/]+)", path)
         if restaurant_match:
             restaurant_id = unquote(restaurant_match.group(1))
@@ -941,6 +1249,18 @@ class TablekeeperService:
             user_id = await self._authenticated_user(headers)
             key = _validate_idempotency_key(headers)
             return await self._create_series(user_id, payload, key)
+
+        series_amend_match = re.fullmatch(r"/series/([^/]+)/amend", path)
+        if series_amend_match:
+            series_id = unquote(series_amend_match.group(1))
+            if not series_id or len(series_id) > 64:
+                raise _invalid("series id must contain 1 to 64 characters")
+            if method == "POST":
+                payload = _require_object(body)
+                user_id = await self._authenticated_user(headers)
+                key = _validate_idempotency_key(headers)
+                return await self._amend_series(series_id, user_id, payload, key, path)
+            raise _not_found()
 
         series_match = re.fullmatch(r"/series/([^/]+)", path)
         if series_match:
@@ -1065,7 +1385,7 @@ class TablekeeperService:
             ):
                 raise _invalid("invalid token state")
 
-            # Ensure manager_user_ids and policies are normalized on imported restaurants
+            # Ensure manager_user_ids, combinable, closures, revision, and policies are normalized on imported restaurants
             for rid, rest in candidate.restaurants.items():
                 if not isinstance(rest, dict):
                     raise _invalid("invalid restaurant state")
@@ -1073,6 +1393,12 @@ class TablekeeperService:
                     rest["manager_user_ids"] = []
                 if "policies" not in rest:
                     rest["policies"] = []
+                if "combinable" not in rest:
+                    rest["combinable"] = []
+                if "closures" not in rest:
+                    rest["closures"] = []
+                if "revision" not in rest:
+                    rest["revision"] = 0
                 for m in rest["manager_user_ids"]:
                     if m not in candidate.users:
                         raise _invalid("manager user does not exist in state")
@@ -1080,7 +1406,7 @@ class TablekeeperService:
             # Reuse the reset-fixture validator for restaurant base configuration, without
             # rehashing accounts or mutating the imported snapshot.
             base_restaurants = [
-                {k: v for k, v in r.items() if k != "policies"}
+                {k: v for k, v in r.items() if k not in ("policies", "closures", "revision")}
                 for r in candidate.restaurants.values()
             ]
             normalized_restaurants = _fixture_state(
@@ -1090,8 +1416,8 @@ class TablekeeperService:
                 norm = normalized_restaurants.get(rid)
                 if norm is None:
                     raise _invalid("invalid restaurant state")
-                base = {k: v for k, v in rest.items() if k != "policies"}
-                norm_base = {k: v for k, v in norm.items() if k != "policies"}
+                base = {k: v for k, v in rest.items() if k not in ("policies", "closures", "revision")}
+                norm_base = {k: v for k, v in norm.items() if k not in ("policies", "closures", "revision")}
                 if base != norm_base:
                     raise _invalid("invalid restaurant state")
                 policies = rest.get("policies", [])
@@ -1110,7 +1436,6 @@ class TablekeeperService:
                 "reference",
                 "user_id",
                 "restaurant_id",
-                "table_id",
                 "party_size",
                 "status",
                 "starts_at_local",
@@ -1119,6 +1444,8 @@ class TablekeeperService:
                 "created_at",
             }
             allowed_reservation_fields = base_reservation_fields | {
+                "table_id",
+                "table_ids",
                 "revision",
                 "accepted_terms",
                 "history",
@@ -1130,7 +1457,8 @@ class TablekeeperService:
             for reference, record in candidate.reservations.items():
                 if not isinstance(reference, str) or not REFERENCE_RE.fullmatch(reference) or not isinstance(record, dict):
                     raise _invalid("invalid reservation state")
-                if not (base_reservation_fields.issubset(set(record)) and set(record).issubset(allowed_reservation_fields)) or record["reference"] != reference:
+                has_tbl = ("table_id" in record) or ("table_ids" in record)
+                if not has_tbl or not (base_reservation_fields.issubset(set(record)) and set(record).issubset(allowed_reservation_fields)) or record["reference"] != reference:
                     raise _invalid("invalid reservation state")
                 if (
                     not isinstance(record["reservation_id"], str)
@@ -1147,6 +1475,14 @@ class TablekeeperService:
                 _aware(record["ends_at"])
                 _aware(record["created_at"])
 
+                if "table_ids" not in record and "table_id" in record:
+                    record["table_ids"] = [record["table_id"]]
+                if "table_ids" in record:
+                    if len(record["table_ids"]) == 1:
+                        record["table_id"] = record["table_ids"][0]
+                    else:
+                        record.pop("table_id", None)
+
                 restaurant = candidate.restaurants[record["restaurant_id"]]
                 if "revision" not in record:
                     record["revision"] = 1
@@ -1154,6 +1490,9 @@ class TablekeeperService:
                     record["accepted_terms"] = extract_accepted_terms(get_policy_0(restaurant))
                 if "history" not in record:
                     terms = record["accepted_terms"]
+                    t_ids = record.get("table_ids") or [record["table_id"]]
+                    change_field = "table_ids" if len(t_ids) > 1 else "table_id"
+                    change_val = list(t_ids) if len(t_ids) > 1 else t_ids[0]
                     hist = [
                         {
                             "seq": 1,
@@ -1162,7 +1501,7 @@ class TablekeeperService:
                             "revision": 1,
                             "accepted_terms": copy.deepcopy(terms),
                             "changes": [
-                                {"field": "table_id", "from": None, "to": record["table_id"]},
+                                {"field": change_field, "from": None, "to": change_val},
                                 {"field": "starts_at_local", "from": None, "to": record["starts_at_local"]},
                                 {"field": "party_size", "from": None, "to": record["party_size"]},
                             ],
@@ -1197,10 +1536,12 @@ class TablekeeperService:
                 if record["status"] == "confirmed"
             ]
             for index, first in enumerate(confirmed):
+                first_tables = set(first.get("table_ids") or [first["table_id"]])
                 for second in confirmed[index + 1 :]:
+                    second_tables = set(second.get("table_ids") or [second["table_id"]])
                     if (
                         first["restaurant_id"] == second["restaurant_id"]
-                        and first["table_id"] == second["table_id"]
+                        and (first_tables & second_tables)
                         and _overlap(
                             _aware(first["starts_at"]),
                             _record_end(first),
@@ -1235,6 +1576,9 @@ class TablekeeperService:
                 valid_path = (
                     receipt.path in ("/reservations", "/reservation-moves", "/series")
                     or bool(re.fullmatch(r"/restaurants/[^/]+/policies", receipt.path))
+                    or bool(re.fullmatch(r"/restaurants/[^/]+/replans", receipt.path))
+                    or bool(re.fullmatch(r"/restaurants/[^/]+/replans/[^/]+/apply", receipt.path))
+                    or bool(re.fullmatch(r"/series/[^/]+/amend", receipt.path))
                 )
                 if (
                     receipt.user_id not in candidate.users
@@ -1290,7 +1634,158 @@ class TablekeeperService:
             version = len(policies) + 1
             record = {"policy_version": version, **validated}
             policies.append(copy.deepcopy(record))
+            cur_rest["revision"] = cur_rest.get("revision", 0) + 1
             return 201, record
+
+        status, response_body, _ = await self.store.idempotent_write(
+            user_id=user_id,
+            method="POST",
+            path=path,
+            key=key,
+            request_body=payload,
+            mutation=mutation,
+        )
+        return ApiResponse(status, response_body)
+
+    async def _create_replan(
+        self,
+        restaurant_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+        key: str,
+        path: str,
+    ) -> ApiResponse:
+        state = await self.store.snapshot()
+        restaurant = state.restaurants.get(restaurant_id)
+        if restaurant is None:
+            raise _not_found()
+        if user_id not in restaurant.get("manager_user_ids", []):
+            raise DomainError(403, "forbidden", "forbidden")
+
+        closure_table_id = payload.get("table_id")
+        from_raw = payload.get("from")
+        to_raw = payload.get("to")
+        if not isinstance(closure_table_id, str) or not isinstance(from_raw, str) or not isinstance(to_raw, str):
+            raise _invalid("table_id, from, and to are required")
+
+        if not any(t["id"] == closure_table_id for t in restaurant["tables"]):
+            raise _not_found()
+
+        try:
+            from_dt = datetime.fromisoformat(from_raw)
+            to_dt = datetime.fromisoformat(to_raw)
+        except Exception as exc:
+            raise _invalid("from and to must be valid ISO timestamps") from exc
+
+        if from_dt.tzinfo is None or to_dt.tzinfo is None:
+            raise _invalid("from and to must have explicit timezone offsets")
+        if from_dt >= to_dt:
+            raise _invalid("from must be earlier than to")
+
+        async def mutation(current: ServiceState) -> tuple[int, dict[str, Any]]:
+            cur_rest = current.restaurants.get(restaurant_id)
+            if cur_rest is None:
+                raise _not_found()
+            if user_id not in cur_rest.get("manager_user_ids", []):
+                raise DomainError(403, "forbidden", "forbidden")
+
+            plan = _compute_replan(cur_rest, closure_table_id, from_dt, to_dt, from_raw, to_raw, current)
+            current.plans[plan["plan_id"]] = plan
+
+            preview_resp = {
+                "plan_id": plan["plan_id"],
+                "restaurant_revision": cur_rest.get("revision", 0),
+                "closure": copy.deepcopy(plan["closure"]),
+                "assignments": copy.deepcopy(plan["assignments"]),
+                "moved_count": plan["moved_count"],
+                "unused_seats": plan["unused_seats"],
+            }
+            return 201, preview_resp
+
+        status, response_body, _ = await self.store.idempotent_write(
+            user_id=user_id,
+            method="POST",
+            path=path,
+            key=key,
+            request_body=payload,
+            mutation=mutation,
+        )
+        return ApiResponse(status, response_body)
+
+    async def _apply_replan(
+        self,
+        restaurant_id: str,
+        plan_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+        key: str,
+        path: str,
+    ) -> ApiResponse:
+        async def mutation(current: ServiceState) -> tuple[int, dict[str, Any]]:
+            cur_rest = current.restaurants.get(restaurant_id)
+            if cur_rest is None:
+                raise _not_found()
+            if user_id not in cur_rest.get("manager_user_ids", []):
+                raise DomainError(403, "forbidden", "forbidden")
+
+            plan = current.plans.get(plan_id)
+            if plan is None or plan.get("restaurant_id") != restaurant_id:
+                raise _not_found()
+
+            if cur_rest.get("revision", 0) != plan["restaurant_revision"]:
+                raise DomainError(409, "stale_plan", "intervening restaurant revision")
+
+            if plan.get("applied") is True:
+                raise DomainError(409, "plan_already_applied", "plan already applied")
+
+            cur_rest.setdefault("closures", []).append(copy.deepcopy(plan["closure"]))
+            affected_series_ids: set[str] = set()
+            now_ts = rfc3339(datetime.now(UTC))
+
+            for assignment in plan["assignments"]:
+                ref = assignment["reference"]
+                rec = current.reservations[ref]
+                new_tables = list(assignment["table_ids"])
+                if assignment["changed"]:
+                    old_tables = rec.get("table_ids") or ([rec["table_id"]] if "table_id" in rec else [])
+                    rec["table_ids"] = list(new_tables)
+                    if len(new_tables) == 1:
+                        rec["table_id"] = new_tables[0]
+                    else:
+                        rec.pop("table_id", None)
+                    rec["revision"] = rec.get("revision", 1) + 1
+
+                    hist = rec.setdefault("history", [])
+                    hist.append({
+                        "seq": len(hist) + 1,
+                        "at": now_ts,
+                        "event": "reassigned",
+                        "revision": rec["revision"],
+                        "plan_id": plan_id,
+                        "accepted_terms": copy.deepcopy(rec.get("accepted_terms", {})),
+                        "changes": [{"field": "table_ids", "from": old_tables, "to": list(new_tables)}],
+                    })
+                    if rec.get("series_id"):
+                        affected_series_ids.add(rec["series_id"])
+
+            for sid in affected_series_ids:
+                if sid in current.series:
+                    current.series[sid]["revision"] = current.series[sid].get("revision", 1) + 1
+
+            cur_rest["revision"] = cur_rest.get("revision", 0) + 1
+            plan["applied"] = True
+
+            reservations_out = [
+                _serialize_reservation(current.reservations[item["reference"]])
+                for item in plan["assignments"]
+            ]
+
+            response_body = {
+                "plan_id": plan_id,
+                "restaurant_revision": cur_rest["revision"],
+                "reservations": reservations_out,
+            }
+            return 201, response_body
 
         status, response_body, _ = await self.store.idempotent_write(
             user_id=user_id,
@@ -1404,7 +1899,9 @@ class TablekeeperService:
                 if duration_seconds <= (close_instant - start_instant).total_seconds():
                     end = start_instant + timedelta(minutes=policy["reservation_duration_minutes"])
                     available = []
+                    available_options = []
                     explain_entries = []
+                    table_cap_map = {t["id"]: t["capacity"] for t in restaurant["tables"]}
                     for table in restaurant["tables"]:
                         tid = table["id"]
                         t_cap = policy["capacities"].get(tid, table["capacity"])
@@ -1419,6 +1916,7 @@ class TablekeeperService:
                         is_avail = holds_cap and holds_no_overlap
                         if is_avail:
                             available.append(tid)
+                            available_options.append({"table_ids": [tid], "capacity": t_cap})
                         if explain_mode:
                             explain_entries.append({
                                 "table_id": tid,
@@ -1429,10 +1927,19 @@ class TablekeeperService:
                                     {"rule": "no_overlap", "holds": holds_no_overlap},
                                 ],
                             })
+                    for pair in restaurant.get("combinable", []):
+                        p1, p2 = pair[0], pair[1]
+                        cap1 = policy["capacities"].get(p1, table_cap_map.get(p1, 0))
+                        cap2 = policy["capacities"].get(p2, table_cap_map.get(p2, 0))
+                        pair_cap = cap1 + cap2
+                        if party_size_fits(pair_cap):
+                            if not _has_conflict(state, restaurant_id, list(pair), start, end):
+                                available_options.append({"table_ids": list(pair), "capacity": pair_cap})
                     slot_data = {
                         "starts_at_local": local_value,
                         "starts_at": rfc3339(start),
                         "available_table_ids": available,
+                        "available_options": available_options,
                     }
                     if explain_mode:
                         slot_data["explain"] = explain_entries
@@ -1452,6 +1959,9 @@ class TablekeeperService:
         async def mutation(state: ServiceState) -> tuple[int, dict[str, Any]]:
             record = _new_reservation(state, user_id, payload)
             state.reservations[record["reference"]] = record
+            restaurant_id = record["restaurant_id"]
+            if restaurant_id in state.restaurants:
+                state.restaurants[restaurant_id]["revision"] = state.restaurants[restaurant_id].get("revision", 0) + 1
             return 201, _serialize_reservation(record)
 
         status, response, _ = await self.store.idempotent_write(
@@ -1504,6 +2014,9 @@ class TablekeeperService:
                 sid = record["series_id"]
                 if sid in state.series:
                     state.series[sid]["revision"] = state.series[sid].get("revision", 1) + 1
+            rest_id = record["restaurant_id"]
+            if rest_id in state.restaurants:
+                state.restaurants[rest_id]["revision"] = state.restaurants[rest_id].get("revision", 0) + 1
             return _serialize_reservation(record)
 
         result = await self.store.transaction(mutation)
@@ -1518,37 +2031,38 @@ class TablekeeperService:
         ignore_references: set[str] | None = None,
         check_occupancy: bool = True,
     ) -> dict[str, Any]:
-        values = {
-            "restaurant_id": record["restaurant_id"],
-            "table_id": record["table_id"],
-            "starts_at_local": record["starts_at_local"],
-            "party_size": record["party_size"],
-        }
-        if "table_id" in changes:
-            values["table_id"] = _required_id(changes, "table_id")
-        if "starts_at_local" in changes:
-            values["starts_at_local"] = changes["starts_at_local"]
-        if "party_size" in changes:
-            values["party_size"] = _party_size(changes)
-        restaurant_id = values["restaurant_id"]
-        table_id = values["table_id"]
-        party_size = _party_size(values)
-        restaurant, table = _restaurant_table(state, restaurant_id, table_id)
+        restaurant_id = record["restaurant_id"]
+        restaurant = state.restaurants.get(restaurant_id)
+        if restaurant is None:
+            raise _not_found()
 
-        naive = _parse_local(values["starts_at_local"])
+        current_table_ids = record.get("table_ids") or ([record["table_id"]] if "table_id" in record else [])
+
+        if "table_id" in changes and "table_ids" in changes:
+            raise _error(422, "validation_failed", "cannot provide both table_id and table_ids")
+
+        if "table_id" in changes or "table_ids" in changes:
+            proposed_table_ids = _normalize_table_selection(restaurant, changes)
+        else:
+            proposed_table_ids = list(current_table_ids)
+
+        proposed_starts = changes.get("starts_at_local", record["starts_at_local"])
+        proposed_party = _party_size(changes) if "party_size" in changes else record["party_size"]
+
+        naive = _parse_local(proposed_starts)
         policy = get_effective_policy(restaurant, naive.date())
-        capacity = policy["capacities"].get(table_id, table["capacity"])
-        if party_size > capacity:
+        capacity = _table_selection_capacity(restaurant, policy, proposed_table_ids)
+        if proposed_party > capacity:
             raise _error(422, "party_exceeds_capacity", "party size exceeds table capacity")
 
-        start, local_string = _resolve_booking_time(restaurant, values["starts_at_local"], policy=policy)
+        start, local_string = _resolve_booking_time(restaurant, proposed_starts, policy=policy)
         end = _instant(start) + timedelta(minutes=policy["reservation_duration_minutes"])
         end_local = end.astimezone(ZoneInfo(restaurant["timezone"]))
 
         if check_occupancy and _has_conflict(
             state,
             restaurant_id,
-            table_id,
+            proposed_table_ids,
             start,
             end,
             ignore_references=ignore_references,
@@ -1556,12 +2070,15 @@ class TablekeeperService:
             raise _error(409, "table_unavailable", "table is unavailable")
 
         changes_list = []
-        if table_id != record["table_id"]:
-            changes_list.append({"field": "table_id", "from": record["table_id"], "to": table_id})
+        if proposed_table_ids != current_table_ids:
+            if len(current_table_ids) > 1 or len(proposed_table_ids) > 1:
+                changes_list.append({"field": "table_ids", "from": current_table_ids, "to": proposed_table_ids})
+            else:
+                changes_list.append({"field": "table_id", "from": current_table_ids[0], "to": proposed_table_ids[0]})
         if local_string != record["starts_at_local"]:
             changes_list.append({"field": "starts_at_local", "from": record["starts_at_local"], "to": local_string})
-        if party_size != record["party_size"]:
-            changes_list.append({"field": "party_size", "from": record["party_size"], "to": party_size})
+        if proposed_party != record["party_size"]:
+            changes_list.append({"field": "party_size", "from": record["party_size"], "to": proposed_party})
 
         new_terms = extract_accepted_terms(policy)
         new_rev = record.get("revision", 1) + 1
@@ -1570,8 +2087,8 @@ class TablekeeperService:
         updated = copy.deepcopy(record)
         updated.update(
             {
-                "table_id": table_id,
-                "party_size": party_size,
+                "table_ids": list(proposed_table_ids),
+                "party_size": proposed_party,
                 "starts_at_local": local_string,
                 "starts_at": rfc3339(start),
                 "ends_at": rfc3339(end_local),
@@ -1579,6 +2096,11 @@ class TablekeeperService:
                 "revision": new_rev,
             }
         )
+        if len(proposed_table_ids) == 1:
+            updated["table_id"] = proposed_table_ids[0]
+        else:
+            updated.pop("table_id", None)
+
         history = updated.setdefault("history", [])
         history.append({
             "seq": len(history) + 1,
@@ -1607,19 +2129,27 @@ class TablekeeperService:
 
             self._check_cutoff(state, current)
 
-            proposed_table = payload.get("table_id", current["table_id"])
+            current_table_ids = current.get("table_ids") or ([current["table_id"]] if "table_id" in current else [])
+            if "table_id" in payload and "table_ids" in payload:
+                raise _error(422, "validation_failed", "cannot provide both table_id and table_ids")
+            if "table_id" in payload or "table_ids" in payload:
+                restaurant = state.restaurants.get(current["restaurant_id"])
+                if restaurant is None:
+                    raise _not_found()
+                proposed_table_ids = _normalize_table_selection(restaurant, payload)
+            else:
+                proposed_table_ids = list(current_table_ids)
+
             proposed_starts = payload.get("starts_at_local", current["starts_at_local"])
             proposed_party = payload.get("party_size", current["party_size"])
 
-            if "table_id" in payload:
-                _required_id(payload, "table_id")
             if "party_size" in payload:
                 _party_size(payload)
             if "starts_at_local" in payload:
                 _parse_local(payload["starts_at_local"])
 
             if (
-                proposed_table == current["table_id"]
+                proposed_table_ids == current_table_ids
                 and proposed_starts == current["starts_at_local"]
                 and proposed_party == current["party_size"]
             ):
@@ -1634,6 +2164,10 @@ class TablekeeperService:
                         if occ["reference"] == reference:
                             occ["exception"] = True
                     updated["is_exception"] = True
+
+            rest_id = current["restaurant_id"]
+            if rest_id in state.restaurants:
+                state.restaurants[rest_id]["revision"] = state.restaurants[rest_id].get("revision", 0) + 1
 
             state.reservations[reference] = updated
             return _serialize_reservation(updated)
@@ -1684,26 +2218,34 @@ class TablekeeperService:
 
                 self._check_cutoff(state, current)
 
-                proposed_table = item.get("table_id", current["table_id"])
+                current_table_ids = current.get("table_ids") or ([current["table_id"]] if "table_id" in current else [])
+                if "table_id" in item and "table_ids" in item:
+                    raise _error(422, "validation_failed", "cannot provide both table_id and table_ids")
+                if "table_id" in item or "table_ids" in item:
+                    rest = state.restaurants.get(current["restaurant_id"])
+                    if rest is None:
+                        raise _not_found()
+                    proposed_table_ids = _normalize_table_selection(rest, item)
+                else:
+                    proposed_table_ids = list(current_table_ids)
+
                 proposed_starts = item.get("starts_at_local", current["starts_at_local"])
                 proposed_party = item.get("party_size", current["party_size"])
 
-                if "table_id" in item:
-                    _required_id(item, "table_id")
                 if "party_size" in item:
                     _party_size(item)
                 if "starts_at_local" in item:
                     _parse_local(item["starts_at_local"])
 
                 if (
-                    proposed_table == current["table_id"]
+                    proposed_table_ids == current_table_ids
                     and proposed_starts == current["starts_at_local"]
                     and proposed_party == current["party_size"]
                 ):
                     updated_records.append(copy.deepcopy(current))
                     changed_flags.append(False)
                 else:
-                    changes = {name: item[name] for name in ("table_id", "starts_at_local", "party_size") if name in item}
+                    changes = {name: item[name] for name in ("table_id", "table_ids", "starts_at_local", "party_size") if name in item}
                     updated = self._amended_record(
                         state,
                         current,
@@ -1719,10 +2261,11 @@ class TablekeeperService:
                     continue
                 start = _aware(updated["starts_at"])
                 end = _record_end(updated)
+                u_tables = updated.get("table_ids") or [updated["table_id"]]
                 if _has_conflict(
                     state,
                     updated["restaurant_id"],
-                    updated["table_id"],
+                    u_tables,
                     start,
                     end,
                     ignore_references=seen,
@@ -1731,12 +2274,14 @@ class TablekeeperService:
             for index, first in enumerate(updated_records):
                 if first.get("status") != "confirmed":
                     continue
+                first_tables = set(first.get("table_ids") or [first["table_id"]])
                 for second in updated_records[index + 1 :]:
                     if second.get("status") != "confirmed":
                         continue
+                    second_tables = set(second.get("table_ids") or [second["table_id"]])
                     if (
                         first["restaurant_id"] == second["restaurant_id"]
-                        and first["table_id"] == second["table_id"]
+                        and (first_tables & second_tables)
                         and _overlap(
                             _aware(first["starts_at"]),
                             _record_end(first),
@@ -1749,7 +2294,7 @@ class TablekeeperService:
             restaurant = state.restaurants[list(restaurant_ids)[0]]
             any_changed = any(changed_flags)
             if any_changed:
-                restaurant["revision"] = restaurant.get("revision", 1) + 1
+                restaurant["revision"] = restaurant.get("revision", 0) + 1
                 affected_series_ids: set[str] = set()
                 for is_changed, updated in zip(changed_flags, updated_records):
                     if is_changed and updated.get("series_id"):
@@ -1841,9 +2386,7 @@ class TablekeeperService:
             restaurant = state.restaurants.get(anchor["restaurant_id"])
             if restaurant is None:
                 raise _not_found()
-            table = next((t for t in restaurant["tables"] if t["id"] == anchor["table_id"]), None)
-            if table is None:
-                raise _not_found()
+            anchor_table_ids = anchor.get("table_ids") or [anchor["table_id"]]
 
             anchor_naive = _parse_local(anchor["starts_at_local"])
             anchor_date = anchor_naive.date()
@@ -1856,7 +2399,7 @@ class TablekeeperService:
                 occ_local_str = f"{occ_date.isoformat()}T{anchor_time_str}"
                 occ_policy = get_effective_policy(restaurant, occ_date)
 
-                occ_cap = occ_policy["capacities"].get(anchor["table_id"], table["capacity"])
+                occ_cap = _table_selection_capacity(restaurant, occ_policy, anchor_table_ids)
                 if anchor["party_size"] > occ_cap:
                     raise _error(422, "party_exceeds_capacity", "party size exceeds table capacity")
 
@@ -1864,10 +2407,11 @@ class TablekeeperService:
                 end = _instant(start) + timedelta(minutes=occ_policy["reservation_duration_minutes"])
                 end_local = end.astimezone(ZoneInfo(restaurant["timezone"]))
 
-                if _has_conflict(state, anchor["restaurant_id"], anchor["table_id"], start, end):
+                if _has_conflict(state, anchor["restaurant_id"], anchor_table_ids, start, end):
                     raise _error(409, "table_unavailable", "table is unavailable")
                 for prev in new_records:
-                    if _overlap(start, end, _aware(prev["starts_at"]), _record_end(prev)):
+                    prev_tables = prev.get("table_ids") or [prev["table_id"]]
+                    if (set(anchor_table_ids) & set(prev_tables)) and _overlap(start, end, _aware(prev["starts_at"]), _record_end(prev)):
                         raise _error(409, "table_unavailable", "table is unavailable")
 
                 while True:
@@ -1876,24 +2420,28 @@ class TablekeeperService:
                         break
 
                 terms = extract_accepted_terms(occ_policy)
+                changes = []
+                if len(anchor_table_ids) > 1:
+                    changes.append({"field": "table_ids", "from": None, "to": list(anchor_table_ids)})
+                else:
+                    changes.append({"field": "table_id", "from": None, "to": anchor_table_ids[0]})
+                changes.append({"field": "starts_at_local", "from": None, "to": local_string})
+                changes.append({"field": "party_size", "from": None, "to": anchor["party_size"]})
+
                 history_entry = {
                     "seq": 1,
                     "at": now_ts,
                     "event": "created",
                     "revision": 1,
                     "accepted_terms": copy.deepcopy(terms),
-                    "changes": [
-                        {"field": "table_id", "from": None, "to": anchor["table_id"]},
-                        {"field": "starts_at_local", "from": None, "to": local_string},
-                        {"field": "party_size", "from": None, "to": anchor["party_size"]},
-                    ],
+                    "changes": changes,
                 }
                 rec = {
                     "reservation_id": uuid.uuid4().hex,
                     "reference": candidate_ref,
                     "user_id": user_id,
                     "restaurant_id": anchor["restaurant_id"],
-                    "table_id": anchor["table_id"],
+                    "table_ids": list(anchor_table_ids),
                     "party_size": anchor["party_size"],
                     "status": "confirmed",
                     "starts_at_local": local_string,
@@ -1906,6 +2454,8 @@ class TablekeeperService:
                     "series_index": i,
                     "is_exception": False,
                 }
+                if len(anchor_table_ids) == 1:
+                    rec["table_id"] = anchor_table_ids[0]
                 new_records.append(rec)
 
             series_id = "s_" + uuid.uuid4().hex
@@ -1931,7 +2481,7 @@ class TablekeeperService:
             }
             state.series[series_id] = series_record
 
-            restaurant["revision"] = restaurant.get("revision", 1) + 1
+            restaurant["revision"] = restaurant.get("revision", 0) + 1
 
             response_occurrences = [
                 {
@@ -1992,3 +2542,160 @@ class TablekeeperService:
                 "occurrences": occurrences,
             },
         )
+
+    async def _amend_series(
+        self,
+        series_id: str,
+        user_id: str,
+        payload: dict[str, Any],
+        key: str,
+        path: str,
+    ) -> ApiResponse:
+        async def mutation(current: ServiceState) -> tuple[int, dict[str, Any]]:
+            series = current.series.get(series_id)
+            if series is None or series.get("user_id") != user_id:
+                raise _not_found()
+
+            if "expected_revision" not in payload or "from_index" not in payload or "local_time" not in payload:
+                raise _invalid("expected_revision, from_index, and local_time are required")
+
+            exp_rev = payload["expected_revision"]
+            if isinstance(exp_rev, bool) or not isinstance(exp_rev, int) or exp_rev <= 0:
+                raise _invalid("expected_revision must be a positive integer")
+
+            from_idx = payload["from_index"]
+            if isinstance(from_idx, bool) or not isinstance(from_idx, int) or not (0 <= from_idx < series.get("count", 0)):
+                raise _invalid("from_index must be an integer in 0..count-1")
+
+            local_time = payload["local_time"]
+            if not isinstance(local_time, str) or not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", local_time):
+                raise _invalid("local_time must be HH:MM in 00:00..23:59")
+
+            if exp_rev != series.get("revision", 1):
+                raise DomainError(409, "stale_revision", "mismatched series revision")
+
+            restaurant = current.restaurants.get(series["restaurant_id"])
+            if restaurant is None:
+                raise _not_found()
+
+            eligible_occurrences = []
+            for occ in series.get("occurrences", []):
+                if occ["index"] < from_idx:
+                    continue
+                if occ.get("exception", False):
+                    continue
+                ref = occ["reference"]
+                rec = current.reservations.get(ref)
+                if rec is None or rec.get("status") == "cancelled":
+                    continue
+                eligible_occurrences.append((occ, rec))
+
+            changes_to_apply = []
+            for occ, rec in eligible_occurrences:
+                curr_starts_at_local = rec["starts_at_local"]
+                date_part = _parse_local(curr_starts_at_local).date()
+                proposed_local = f"{date_part.isoformat()}T{local_time}"
+
+                if proposed_local == curr_starts_at_local:
+                    continue
+
+                self._check_cutoff(current, rec)
+                pol = get_effective_policy(restaurant, date_part)
+                start_instant, resolved_local = _resolve_booking_time(restaurant, proposed_local, policy=pol)
+                duration = timedelta(minutes=pol["reservation_duration_minutes"])
+                end_instant = start_instant + duration
+                end_local = end_instant.astimezone(ZoneInfo(restaurant["timezone"]))
+
+                rec_table_ids = rec.get("table_ids") or [rec["table_id"]]
+                cap = _table_selection_capacity(restaurant, pol, rec_table_ids)
+                if rec["party_size"] > cap:
+                    raise _error(422, "party_exceeds_capacity", "party size exceeds table capacity")
+
+                changes_to_apply.append({
+                    "occ": occ,
+                    "rec": rec,
+                    "policy": pol,
+                    "start_instant": start_instant,
+                    "end_instant": end_instant,
+                    "resolved_local": resolved_local,
+                    "end_local": end_local,
+                })
+
+            if changes_to_apply:
+                changed_refs = {item["rec"]["reference"] for item in changes_to_apply}
+                for item in changes_to_apply:
+                    rec_tables = item["rec"].get("table_ids") or [item["rec"]["table_id"]]
+                    if _has_conflict(
+                        current,
+                        restaurant["id"],
+                        rec_tables,
+                        item["start_instant"],
+                        item["end_instant"],
+                        ignore_references=changed_refs,
+                    ):
+                        raise _error(409, "table_unavailable", "table is unavailable")
+
+                for i, first in enumerate(changes_to_apply):
+                    first_tables = set(first["rec"].get("table_ids") or [first["rec"]["table_id"]])
+                    for second in changes_to_apply[i + 1 :]:
+                        second_tables = set(second["rec"].get("table_ids") or [second["rec"]["table_id"]])
+                        if (first_tables & second_tables) and _overlap(
+                            first["start_instant"], first["end_instant"],
+                            second["start_instant"], second["end_instant"]
+                        ):
+                            raise _error(409, "table_unavailable", "table is unavailable")
+
+            now_ts = rfc3339(datetime.now(UTC))
+            for item in changes_to_apply:
+                rec = item["rec"]
+                old_starts = rec["starts_at_local"]
+                rec["starts_at_local"] = item["resolved_local"]
+                rec["starts_at"] = rfc3339(item["start_instant"])
+                rec["ends_at"] = rfc3339(item["end_local"])
+                new_terms = extract_accepted_terms(item["policy"])
+                rec["accepted_terms"] = new_terms
+                rec["revision"] = rec.get("revision", 1) + 1
+
+                hist = rec.setdefault("history", [])
+                hist.append({
+                    "seq": len(hist) + 1,
+                    "at": now_ts,
+                    "event": "changed",
+                    "revision": rec["revision"],
+                    "accepted_terms": copy.deepcopy(new_terms),
+                    "changes": [{"field": "starts_at_local", "from": old_starts, "to": item["resolved_local"]}],
+                })
+
+            if changes_to_apply:
+                series["revision"] = series.get("revision", 1) + 1
+                restaurant["revision"] = restaurant.get("revision", 0) + 1
+
+            occurrences_out = []
+            for occ in series.get("occurrences", []):
+                ref = occ["reference"]
+                r = current.reservations.get(ref)
+                if r is not None:
+                    occurrences_out.append({
+                        "index": occ["index"],
+                        "reference": ref,
+                        "exception": occ.get("exception", False),
+                        "reservation": _serialize_reservation(r),
+                    })
+
+            resp_body = {
+                "series_id": series["series_id"],
+                "revision": series["revision"],
+                "interval_weeks": series["interval_weeks"],
+                "occurrences": occurrences_out,
+            }
+            return 201, resp_body
+
+        status, response_body, _ = await self.store.idempotent_write(
+            user_id=user_id,
+            method="POST",
+            path=path,
+            key=key,
+            request_body=payload,
+            mutation=mutation,
+        )
+        return ApiResponse(status, response_body)

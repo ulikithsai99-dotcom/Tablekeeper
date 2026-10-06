@@ -23,6 +23,7 @@ class ServiceState:
     restaurants: dict[str, dict[str, Any]] = field(default_factory=dict)
     reservations: dict[str, dict[str, Any]] = field(default_factory=dict)
     series: dict[str, dict[str, Any]] = field(default_factory=dict)
+    plans: dict[str, dict[str, Any]] = field(default_factory=dict)
     receipts: dict[tuple[str, str, str, str], IdempotencyReceipt] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -32,19 +33,23 @@ class ServiceState:
             "restaurants": copy.deepcopy(self.restaurants),
             "reservations": copy.deepcopy(self.reservations),
             "series": copy.deepcopy(self.series),
+            "plans": copy.deepcopy(self.plans),
             "receipts": [receipt.to_dict() for receipt in self.receipts.values()],
         }
 
     @classmethod
     def from_dict(cls, value: Any) -> "ServiceState":
         valid_keys = {"users", "tokens", "restaurants", "reservations", "receipts"}
-        if not isinstance(value, dict) or not (valid_keys.issubset(value.keys()) and set(value.keys()) <= (valid_keys | {"series"})):
+        if not isinstance(value, dict) or not (valid_keys.issubset(value.keys()) and set(value.keys()) <= (valid_keys | {"series", "plans"})):
             raise DomainError(422, "validation_failed", "invalid state")
         for name in ("users", "tokens", "restaurants", "reservations"):
             if not isinstance(value[name], dict):
                 raise DomainError(422, "validation_failed", "invalid state")
         series_dict = value.get("series", {})
         if not isinstance(series_dict, dict):
+            raise DomainError(422, "validation_failed", "invalid state")
+        plans_dict = value.get("plans", {})
+        if not isinstance(plans_dict, dict):
             raise DomainError(422, "validation_failed", "invalid state")
         if not isinstance(value["receipts"], list):
             raise DomainError(422, "validation_failed", "invalid state")
@@ -60,6 +65,7 @@ class ServiceState:
             restaurants=copy.deepcopy(value["restaurants"]),
             reservations=copy.deepcopy(value["reservations"]),
             series=copy.deepcopy(series_dict),
+            plans=copy.deepcopy(plans_dict),
             receipts=receipts,
         )
 
