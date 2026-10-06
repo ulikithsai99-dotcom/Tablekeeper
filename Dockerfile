@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir -r /app/requirements.txt
-COPY stage-1 /app/stage-1
+COPY stage-4 /app/stage-4
 EXPOSE 8080
 
-CMD ["python", "/app/stage-1/server.py"]
+CMD ["python", "/app/stage-4/server.py"]

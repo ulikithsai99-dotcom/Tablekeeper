@@ -1144,7 +1144,7 @@ class TablekeeperService:
                 if os.path.isfile(index_path):
                     with open(index_path, "rb") as f:
                         return ApiResponse(200, f.read(), content_type="text/html; charset=utf-8")
-            return ApiResponse(200, {"service": "Tablekeeper", "stage": 3, "health": "/health"})
+            return ApiResponse(200, {"service": "Tablekeeper", "stage": 4, "health": "/health"})
 
         if method == "GET" and (path.startswith(("/static/", "/assets/")) or path.endswith((".css", ".js", ".jpg", ".jpeg", ".png", ".webp", ".svg", ".woff2", ".ico"))):
             rel_path = path.lstrip("/")

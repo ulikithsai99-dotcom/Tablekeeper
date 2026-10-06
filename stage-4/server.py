@@ -140,7 +140,7 @@ async def _serve() -> None:
     server = TablekeeperHTTPServer(("0.0.0.0", port), loop)
     thread = threading.Thread(target=server.serve_forever, name="tablekeeper-http", daemon=True)
     thread.start()
-    print(f"Tablekeeper Stage 3 listening on 0.0.0.0:{port}", flush=True)
+    print(f"Tablekeeper Stage 4 listening on 0.0.0.0:{port}", flush=True)
     try:
         await asyncio.Event().wait()
     finally:
